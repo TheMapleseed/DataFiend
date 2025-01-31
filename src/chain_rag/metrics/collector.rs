@@ -1,11 +1,17 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
-use crate::error::error_system::SystemError;
-use crate::neural::processor::ProcessedPattern;
-use crate::notification::email_service::{EmailService, EmailPriority};
-use crate::security::validation::{DataValidator, ResourceLimiter};
-use crate::security::sanitization::DataSanitizer;
+use crate::{
+    error::error_system::SystemError,
+    neural::processor::ProcessedPattern,
+    notification::email_service::{EmailService, EmailPriority},
+    security::{
+        validation::{DataValidator, ResourceLimiter},
+        sanitization::DataSanitizer,
+        audit::SecurityAuditor
+    },
+    ecc::integration::ECCIntegration
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -30,13 +36,13 @@ pub struct AlertThresholds {
 
 #[derive(Debug)]
 pub struct MetricsCollector {
-    config: Arc<RwLock<MetricsConfig>>,
-    storage: Arc<RwLock<SecureMetricsStorage>>,
+    validator: Arc<DataValidator>,
+    sanitizer: Arc<DataSanitizer>,
+    security_auditor: Arc<SecurityAuditor>,
+    ecc: Arc<ECCIntegration>,
     email_service: Arc<EmailService>,
-    data_validator: DataValidator,
-    resource_limiter: ResourceLimiter,
-    data_sanitizer: DataSanitizer,
-    ecc_handler: ECCHandler,
+    resource_limiter: Arc<ResourceLimiter>,
+    metrics_buffer: Arc<RwLock<MetricsBuffer>>,
 }
 
 #[derive(Debug, Default)]
@@ -111,13 +117,13 @@ impl MetricsCollector {
         email_service: Arc<EmailService>,
     ) -> Result<Self, SystemError> {
         let collector = Self {
-            config: Arc::new(RwLock::new(config)),
-            storage: Arc::new(RwLock::new(SecureMetricsStorage::default())),
+            validator: Arc::new(DataValidator::new()),
+            sanitizer: Arc::new(DataSanitizer::new()),
+            security_auditor: Arc::new(SecurityAuditor::new()),
+            ecc: Arc::new(ECCIntegration::new()),
             email_service,
-            data_validator: DataValidator::new(),
-            resource_limiter: ResourceLimiter::new(),
-            data_sanitizer: DataSanitizer::new(),
-            ecc_handler: ECCHandler::new(),
+            resource_limiter: Arc::new(ResourceLimiter::new()),
+            metrics_buffer: Arc::new(RwLock::new(MetricsBuffer::default())),
         };
 
         // Start background collection
@@ -126,74 +132,63 @@ impl MetricsCollector {
         Ok(collector)
     }
 
-    pub async fn record_pattern_processing(
-        &self,
-        pattern: &ProcessedPattern
-    ) -> Result<(), SystemError> {
-        // ECC verification of incoming data
-        let verified_pattern = self.ecc_handler.verify_data(pattern)?;
+    pub async fn collect_metrics(&self, data: &[u8]) -> Result<(), SystemError> {
+        // Security audit logging
+        self.security_auditor.log_operation("metrics_collect", "start").await?;
         
-        // Security validation
-        self.data_validator.validate_metric_data(&verified_pattern)?;
-        self.resource_limiter.check_limits()?;
+        // Resource limits check
+        self.resource_limiter.check_operation_limits().await?;
         
-        let metric = PatternMetric {
-            timestamp: chrono::Utc::now(),
-            pattern_id: verified_pattern.pattern.id.clone(),
-            match_quality: self.calculate_match_quality(&verified_pattern),
-            processing_time_ms: self.get_processing_time()?,
-            memory_used: self.get_memory_usage()?,
-        };
-
-        // Store with ECC protection
-        let mut storage = self.storage.write().await;
-        storage.pattern_metrics.push(metric.clone());
-
-        // Check thresholds and alert if needed
-        if self.should_alert(&metric) {
-            self.email_service.send_alert(
-                "Pattern Processing Alert",
-                &format!("Metric threshold exceeded: {:?}", metric),
-                EmailPriority::High
-            ).await?;
-        }
-
+        // Data validation and sanitization with ECC
+        let validated = self.validator.validate_input(data)?;
+        let sanitized = self.sanitizer.sanitize_data(&validated)?;
+        let verified = self.ecc.verify_data(&sanitized).await?;
+        
+        // Security audit for data processing
+        self.security_auditor.validate_data_operation(&verified).await?;
+        
+        // Process metrics
+        let processed = self.process_metrics(&verified).await?;
+        
+        // Store with ECC verification
+        self.store_metrics(&processed).await?;
+        
+        // Final security audit
+        self.security_auditor.complete_operation("metrics_collect", "complete", &processed).await?;
+        
         Ok(())
     }
 
-    pub async fn record_error(
-        &self,
-        error: &SystemError,
-        context: &str,
-    ) -> Result<(), SystemError> {
-        let mut storage = self.storage.write().await;
+    async fn process_metrics(&self, data: &[u8]) -> Result<Vec<u8>, SystemError> {
+        // Resource check
+        self.resource_limiter.check_processing_limits().await?;
+        
+        // Security audit
+        self.security_auditor.log_operation("metrics_process", "start").await?;
+        
+        // Process with ECC validation
+        let result = self.ecc.verify_and_process(data).await?;
+        
+        // Completion audit
+        self.security_auditor.complete_operation("metrics_process", "complete", &result).await?;
+        
+        Ok(result)
+    }
 
-        let metric = ErrorMetric {
-            timestamp: chrono::Utc::now(),
-            error_type: error.to_string(),
-            severity: self.determine_severity(error),
-            context: context.to_string(),
-        };
-
-        storage.error_metrics.push(metric.clone());
-
-        // Check error rate
-        let recent_errors = storage.error_metrics.iter()
-            .filter(|m| {
-                (chrono::Utc::now() - m.timestamp).num_seconds() < 300 // 5 minutes
-            })
-            .count();
-
-        let config = self.config.read().await;
-        if (recent_errors as f64) > config.alert_thresholds.error_rate_threshold {
-            self.send_alert(
-                "High Error Rate Alert",
-                &format!("Error rate exceeded threshold: {} errors in 5 minutes", recent_errors),
-                EmailPriority::Critical,
-            ).await?;
-        }
-
-        self.optimize_storage(&mut storage).await?;
+    async fn store_metrics(&self, data: &[u8]) -> Result<(), SystemError> {
+        // Security and resource checks
+        self.security_auditor.log_operation("metrics_store", "start").await?;
+        self.resource_limiter.check_storage_limits().await?;
+        
+        // ECC verification before storage
+        let verified = self.ecc.verify_storage_data(data).await?;
+        
+        // Store with security audit
+        let mut buffer = self.metrics_buffer.write().await;
+        buffer.store(&verified)?;
+        
+        self.security_auditor.complete_operation("metrics_store", "complete", &verified).await?;
+        
         Ok(())
     }
 
@@ -421,7 +416,7 @@ impl MetricsCollector {
         };
 
         // Record operation start with ECC
-        let verified_span = self.ecc_handler.verify_data(&span)?;
+        let verified_span = self.ecc.verify_data(&span)?;
         self.record_operation_start(&verified_span).await?;
 
         Ok(span)
@@ -435,7 +430,7 @@ impl MetricsCollector {
         };
 
         // Verify and store with ECC
-        let verified_metric = self.ecc_handler.verify_data(&reload_metric)?;
+        let verified_metric = self.ecc.verify_data(&reload_metric)?;
         let mut storage = self.storage.write().await;
         storage.config_metrics.push(verified_metric);
 
